@@ -10,6 +10,7 @@ import {
 } from './state'
 import { markRaw, toRaw } from '@common/utils/vueTools'
 import { getMusicUrl, getPicUrl, getLyricInfo } from '@renderer/core/music/online'
+import { getOtherSource, getOnlineOtherSourceMusicUrl } from '@renderer/core/music/utils'
 import { appSetting } from '../setting'
 import { qualityList } from '..'
 import { proxyCallback } from '@renderer/worker/utils'
@@ -207,46 +208,92 @@ const downloadLyric = (downloadInfo: LX.Download.ListItem) => {
 
 const getUrl = async(downloadInfo: LX.Download.ListItem, isRefresh: boolean = false) => {
   let toggleMusicInfo = downloadInfo.metadata.musicInfo.meta.toggleMusicInfo
+  console.log('download getUrl start', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source, 'isRefresh=', isRefresh, 'toggleMusicInfo=', toggleMusicInfo ? toggleMusicInfo.source : null)
   return (toggleMusicInfo ? getMusicUrl({
     musicInfo: toggleMusicInfo,
     isRefresh,
     quality: downloadInfo.metadata.quality,
     allowToggleSource: false,
   }) : Promise.reject(new Error('not found'))).catch(() => {
+    console.log('download getUrl try original source with allowToggleSource=', appSetting['download.isUseOtherSource'])
     return getMusicUrl({
       musicInfo: downloadInfo.metadata.musicInfo,
       isRefresh: false,
       quality: downloadInfo.metadata.quality,
       allowToggleSource: appSetting['download.isUseOtherSource'],
     })
-  }).catch(() => '')
-}
-const handleRefreshUrl = (downloadInfo: LX.Download.ListItem) => {
-  setStatusText(downloadInfo, window.i18n.t('download_status_error_refresh_url'))
-  let toggleMusicInfo = downloadInfo.metadata.musicInfo.meta.toggleMusicInfo
-  ;(toggleMusicInfo ? getMusicUrl({
-    musicInfo: toggleMusicInfo,
-    isRefresh: true,
-    quality: downloadInfo.metadata.quality,
-    allowToggleSource: false,
-  }) : Promise.reject(new Error('not found'))).catch(() => {
-    return getMusicUrl({
-      musicInfo: downloadInfo.metadata.musicInfo,
-      isRefresh: true,
-      quality: downloadInfo.metadata.quality,
-      allowToggleSource: appSetting['download.isUseOtherSource'],
-    })
+  }).catch(err => {
+    console.log('download getUrl failed', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source, err)
+    return ''
+  }).then(url => {
+    console.log('download getUrl result', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source, 'url=', url)
+    return url
   })
-    .catch(() => '')
-    .then(url => {
-    // commit('setStatusText', { downloadInfo, text: '链接刷新成功' })
-      setUrl(downloadInfo, url)
-      void window.lx.worker.download.updateUrl(downloadInfo.id, url)
-    })
-    .catch(err => {
-      console.log(err)
-      handleError(downloadInfo, err.message)
-    })
+}
+const handleRefreshUrl = async(downloadInfo: LX.Download.ListItem) => {
+  console.log('handleRefreshUrl start', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source)
+  setStatusText(downloadInfo, window.i18n.t('download_status_error_refresh_url'))
+  let url = ''
+
+  if (appSetting['download.isUseOtherSource']) {
+    try {
+      const otherSource = await getOtherSource(downloadInfo.metadata.musicInfo)
+      console.log('handleRefreshUrl otherSource', otherSource.map(info => ({ source: info.source, id: info.id })))
+      if (otherSource.length) {
+          const result = await getOnlineOtherSourceMusicUrl({
+            musicInfos: [...otherSource],
+            quality: downloadInfo.metadata.quality,
+            onToggleSource: () => {},
+            isRefresh: true,
+            retryedSource: [downloadInfo.metadata.musicInfo.source],
+          })
+          url = result.url
+          try {
+            // 当换源成功时，更新任务的 musicInfo 与质量，使后续嵌入封面/歌词使用新来源的数据
+            if (result.musicInfo && result.musicInfo.id && result.musicInfo.source) {
+              // 保持为 raw 对象以免被 Vue 响应式包裹
+              downloadInfo.metadata.musicInfo = markRaw(result.musicInfo)
+              downloadInfo.metadata.quality = result.quality || downloadInfo.metadata.quality
+              throttleUpdateTask([downloadInfo])
+            }
+          } catch (e) {
+            console.log('handleRefreshUrl update musicInfo failed', e)
+          }
+        }
+    } catch (err) {
+      console.log('handleRefreshUrl otherSource failed', err)
+    }
+  }
+
+  if (!url) {
+    let toggleMusicInfo = downloadInfo.metadata.musicInfo.meta.toggleMusicInfo
+    try {
+      url = await (toggleMusicInfo ? getMusicUrl({
+        musicInfo: toggleMusicInfo,
+        isRefresh: true,
+        quality: downloadInfo.metadata.quality,
+        allowToggleSource: false,
+      }) : Promise.reject(new Error('not found')))
+    } catch (err) {
+      console.log('handleRefreshUrl first attempt failed', err)
+      try {
+        url = await getMusicUrl({
+          musicInfo: downloadInfo.metadata.musicInfo,
+          isRefresh: true,
+          quality: downloadInfo.metadata.quality,
+          allowToggleSource: appSetting['download.isUseOtherSource'],
+        })
+      } catch (err2: any) {
+        console.log('handleRefreshUrl second attempt failed', err2)
+        handleError(downloadInfo, err2?.message ?? String(err2))
+        return
+      }
+    }
+  }
+
+  console.log('handleRefreshUrl got url', url)
+  setUrl(downloadInfo, url)
+  void window.lx.worker.download.updateUrl(downloadInfo.id, url)
 }
 const handleError = (downloadInfo: LX.Download.ListItem, message?: string) => {
   setStatus(downloadInfo, DOWNLOAD_STATUS.ERROR, message)
@@ -289,9 +336,11 @@ const handleStartTask = async(downloadInfo: LX.Download.ListItem) => {
         void checkStartTask()
         break
       case 'refreshUrl':
+        console.log('download task event: refreshUrl', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source)
         handleRefreshUrl(downloadInfo)
         break
       case 'statusText':
+        console.log('download task event: statusText', event.data)
         setStatusText(downloadInfo, event.data)
         break
       case 'progress':

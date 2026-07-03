@@ -33,7 +33,11 @@ export const checkList = (list: LX.Download.ListItem[], musicInfo: LX.Music.Musi
 // }
 const sendAction = (id: string, action: LX.Download.DownloadTaskActions) => {
   const callback = taskActions.get(id)
-  if (!callback) return
+  console.log('worker sendAction', id, action.action)
+  if (!callback) {
+    console.log('worker sendAction no callback', id, action)
+    return
+  }
   callback(action)
 }
 
@@ -154,7 +158,9 @@ const createTask = async(downloadInfo: LX.Download.ListItem, savePath: string, s
         })
         return
       }
-      if (err.code == 'ENOTFOUND') {
+      const refreshOnError = err.code == 'ENOTFOUND' || err.message == 'Progress is 0, download failed.' || err.message == 'Content length is 0' || err.message == 'download timeout'
+      console.log('Download error for', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source, 'code=', err.code, 'message=', err.message, 'refreshOnError=', refreshOnError)
+      if (refreshOnError) {
         sendAction(downloadInfo.id, { action: 'refreshUrl' })
       } else {
         console.log('Download failed, Attempting Retry')
@@ -183,9 +189,11 @@ const createTask = async(downloadInfo: LX.Download.ListItem, savePath: string, s
         }
         return
       }
+      console.log('Download fail response for', downloadInfo.metadata.musicInfo.name, downloadInfo.metadata.musicInfo.source, 'statusCode=', response.statusCode)
       switch (response.statusCode) {
         case 401:
         case 403:
+        case 404:
         case 410:
           sendAction(downloadInfo.id, { action: 'refreshUrl' })
           // commit('onError', { downloadInfo, errorMsg: '链接失效' })
